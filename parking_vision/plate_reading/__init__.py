@@ -1,5 +1,5 @@
-from parking_vision.common.video import open_writer, resolve_source
-from parking_vision.plate_reading import (
+from .cli import main, parse_args
+from .reader import (
     ALLOWLIST,
     CONF_THRESHOLD,
     EasyOCRReader,
@@ -9,16 +9,12 @@ from parking_vision.plate_reading import (
     MODEL_PATH,
     PlateReader,
     RUS_PLATE_PATTERN,
-    VideoOutputConfig,
     crop_bbox,
     is_valid_plate,
-    main,
     normalize_plate,
-    parse_args,
     preprocess,
-    run_plate_reading,
 )
-from parking_vision.plate_reading.io import save_detections_csv, save_detections_jsonl
+from .runner import VideoOutputConfig, run_plate_reading
 
 __all__ = [
     "ALLOWLIST",
@@ -35,15 +31,7 @@ __all__ = [
     "is_valid_plate",
     "main",
     "normalize_plate",
-    "open_writer",
     "parse_args",
     "preprocess",
-    "resolve_source",
     "run_plate_reading",
-    "save_detections_csv",
-    "save_detections_jsonl",
 ]
-
-
-if __name__ == "__main__":
-    main()
