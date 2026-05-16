@@ -1,7 +1,6 @@
 from typing import Any
 
 import numpy as np
-from ultralytics import YOLO
 
 from .constants import (
     ALLOWLIST,
@@ -12,7 +11,7 @@ from .constants import (
     MODEL_PATH,
     RUS_PLATE_PATTERN,
 )
-from .ocr import EasyOCRReader
+from .ocr import EasyOCRReader, PaddleOCRReader
 from .preprocessing import crop_bbox, is_valid_plate, normalize_plate, preprocess
 
 
@@ -24,8 +23,10 @@ class PlateReader:
         iou: float = 0.5,
         imgsz: int = 1280,
     ) -> None:
+        from ultralytics import YOLO
+
         self.model = YOLO(model_path)
-        self.ocr = EasyOCRReader()
+        self.ocr = PaddleOCRReader()
         self.conf = conf
         self.iou = iou
         self.imgsz = imgsz
@@ -44,11 +45,16 @@ class PlateReader:
                 continue
 
             crop = crop_bbox(frame, bbox)
-            prepared_crop = preprocess(crop)
-            if prepared_crop is None:
+            if crop is None:
                 continue
 
-            text, score = self.ocr.read(prepared_crop)
+            text, score = self.ocr.read(crop)
+            if score < 0.4:
+                prepared_crop = preprocess(crop)
+                if prepared_crop is None:
+                    continue
+                text, score = self.ocr.read(prepared_crop)
+
             if score < 0.4:
                 continue
 
@@ -74,6 +80,7 @@ __all__ = [
     "MIN_AREA",
     "MODEL_PATH",
     "PlateReader",
+    "PaddleOCRReader",
     "RUS_PLATE_PATTERN",
     "crop_bbox",
     "is_valid_plate",

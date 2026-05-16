@@ -2,7 +2,6 @@ from pathlib import Path
 from typing import Any
 
 import cv2
-from ultralytics import YOLO
 
 from perception_types import BoundingBox, Detection, FrameDetections
 
@@ -19,6 +18,8 @@ class CarTracker:
         iou: float = 0.45,
         imgsz: int = 1280,
     ) -> None:
+        from ultralytics import YOLO
+
         self.model_path = Path(model_path)
         if not self.model_path.exists():
             raise FileNotFoundError(f"Model not found: {self.model_path}")

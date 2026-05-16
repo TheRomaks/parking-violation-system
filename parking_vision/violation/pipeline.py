@@ -43,10 +43,11 @@ class ViolationPipeline:
             stop_frames_threshold=stop_frames_threshold,
         )
 
-    def _has_plate_candidate(self) -> bool:
-        return any(
-            state.get("active_zone") is not None and state.get("is_parked")
-            for state in self.car_state_manager.track_states.values()
+    @staticmethod
+    def _point_inside_bbox(x: float, y: float, bbox: BoundingBox, margin_px: float = 12.0) -> bool:
+        return (
+            (bbox.x1 - margin_px) <= x <= (bbox.x2 + margin_px)
+            and (bbox.y1 - margin_px) <= y <= (bbox.y2 + margin_px)
         )
 
     def _assign_plate_matches(self, plate_matches: dict[int, str]) -> None:
@@ -78,19 +79,28 @@ class ViolationPipeline:
             if plate_area <= 0:
                 continue
 
+            plate_center_x = (plate_box.x1 + plate_box.x2) / 2.0
+            plate_center_y = (plate_box.y1 + plate_box.y2) / 2.0
+
             best_id = None
             best_score = 0.0
             for car in car_detections:
                 if car.track_id is None:
                     continue
-                intersection = bbox_intersection_area(plate_box, car.bbox)
-                if intersection > 0:
-                    score = intersection / plate_area
-                    if score > best_score:
-                        best_score = score
-                        best_id = car.track_id
 
-            if best_id is not None and best_score > 0.3 and plate.get("text"):
+                center_inside = self._point_inside_bbox(plate_center_x, plate_center_y, car.bbox)
+                intersection = bbox_intersection_area(plate_box, car.bbox)
+                score = 0.0
+                if intersection > 0:
+                    score = max(score, intersection / plate_area)
+                if center_inside:
+                    score = max(score, 0.75)
+
+                if score > best_score:
+                    best_score = score
+                    best_id = car.track_id
+
+            if best_id is not None and best_score > 0.15 and plate.get("text"):
                 matches[best_id] = plate["text"]
 
         return matches
@@ -121,7 +131,7 @@ class ViolationPipeline:
     ) -> tuple[Any, list[ViolationRecord], PipelineFrameResult]:
         car_frame = self.car_tracker.process_frame(frame, frame_index, timestamp_ms)
         sign_detections = self._get_sign_detections(frame, frame_index, timestamp_ms)
-        active_zones = self.sign_zone_manager.build_zones(sign_detections, frame)
+        active_zones = self.sign_zone_manager.build_zones(sign_detections, frame, car_frame.detections)
 
         violations: list[ViolationRecord] = []
         active_ids: set[int] = set()
@@ -134,11 +144,9 @@ class ViolationPipeline:
 
         self.car_state_manager.cleanup(timestamp_ms, active_ids)
 
-        plate_matches: dict[int, str] = {}
-        if self._has_plate_candidate():
-            plate_frame = self._get_plate_result(frame, frame_index)
-            plate_matches = self._match_plates_to_cars(car_frame.detections, plate_frame)
-            self._assign_plate_matches(plate_matches)
+        plate_frame = self._get_plate_result(frame, frame_index)
+        plate_matches = self._match_plates_to_cars(car_frame.detections, plate_frame)
+        self._assign_plate_matches(plate_matches)
 
         for car in car_frame.detections:
             if car.track_id is None:

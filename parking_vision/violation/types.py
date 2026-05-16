@@ -15,6 +15,12 @@ class SignZone:
     polygon: list[tuple[int, int]]
     source_bbox: BoundingBox
     time_limit_s: float
+    restriction: str = "prohibition"
+    applies_now: bool = True
+    side: str = "unknown"
+    direction: str = "forward"
+    plate_labels: list[str] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
     _bbox_x1: int = field(default=0, repr=False)
     _bbox_y1: int = field(default=0, repr=False)
     _bbox_x2: int = field(default=0, repr=False)
