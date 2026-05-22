@@ -23,10 +23,11 @@ class PlateReader:
         iou: float = 0.5,
         imgsz: int = 1280,
     ) -> None:
+        self.ocr = PaddleOCRReader()
+
         from ultralytics import YOLO
 
         self.model = YOLO(model_path)
-        self.ocr = PaddleOCRReader()
         self.conf = conf
         self.iou = iou
         self.imgsz = imgsz

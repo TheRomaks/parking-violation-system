@@ -111,7 +111,6 @@ def group_sign_stacks(detections: list[Detection]) -> list[SignStack]:
             px1, py1, px2, py2 = plate.bbox.to_int_tuple()
             plate_cx = 0.5 * (px1 + px2)
             plate_cy = 0.5 * (py1 + py2)
-
             x_ok = abs(plate_cx - main_cx) <= max(main_w * 1.25, 42.0)
             y_ok = (my1 - 0.35 * main_h) <= plate_cy <= (my2 + 3.25 * main_h)
             if x_ok and y_ok:
@@ -142,13 +141,16 @@ def build_rule(
     time_limit_s = 0.0 if label in NO_STOPPING_LABELS else time_limits.get(stack.main.class_id, parking_time_limit_s)
     applies_now = _date_rule_applies(label, now)
 
-    # Упрощённая логика по твоему запросу:
-    # 8.2.1-8.2.4 сейчас НЕ меняют направление/старт зоны.
+    # Mapping for signs 3.27-3.30:
+    # - default: start_mode="from_sign", direction="forward";
+    # - 8.2.2 / distance plate: direction="forward";
+    # - 8.2.3: start_mode="to_sign", direction="backward";
+    # - 8.2.4: start_mode="inside_zone", direction="both".
     start_mode = "from_sign"
     direction = "forward"
 
     metadata: dict[str, object] = {
-        "zone_direction_simplified": False,
+        "rule_mapping": "ru_pdd_3_27_3_30_v1",
     }
 
     zone_distance_plates = [p for p in plate_labels if p in ZONE_DISTANCE_PLATE_LABELS]
@@ -220,8 +222,7 @@ def _distance_from_metadata(plates: list[Detection]) -> float | None:
             if distance > 0.0:
                 return distance
 
-        # Осторожный OCR/текстовый fallback.
-        # Не парсим class_name вроде "8.2.1", чтобы случайно не получить 8.2 метра.
+        # Conservative OCR fallback. Do not parse labels such as "8.2.1" as meters.
         for key in ("ocr_text", "text"):
             raw = plate.metadata.get(key)
             if not raw:

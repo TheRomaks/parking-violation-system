@@ -1,6 +1,6 @@
-from typing import Any
-
 import os
+import importlib
+from typing import Any
 
 import cv2
 import numpy as np
@@ -77,6 +77,7 @@ def _normalize_candidates(candidates: list[tuple[str, float]]) -> tuple[str, flo
 
 def _build_reader(device: str):
     os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
+    _ensure_paddle_ready()
     from paddleocr import TextRecognition
 
     print(f"[OCR worker] TextRecognition device: {device}")
@@ -84,6 +85,26 @@ def _build_reader(device: str):
         model_name="en_PP-OCRv5_mobile_rec",
         device=device,
     )
+
+
+def _ensure_paddle_ready() -> None:
+    """Import Paddle fully before PaddleOCR touches it.
+
+    PaddleOCR imports several Paddle submodules during its own initialization,
+    so the worker checks Paddle before handing control to PaddleOCR. Do not
+    delete Paddle submodules here: Paddle loads native .pyd modules such as
+    paddle.base.libpaddle, and they are not safely reloadable inside one process.
+    """
+
+    try:
+        paddle = importlib.import_module("paddle")
+        importlib.import_module("paddle.tensor")
+        importlib.import_module("paddle.base.libpaddle")
+    except Exception as exc:
+        raise RuntimeError(f"Paddle failed to initialize cleanly: {exc}") from exc
+
+    if not hasattr(paddle, "tensor"):
+        raise RuntimeError("Paddle failed to initialize cleanly: paddle.tensor is unavailable")
 
 
 def _prepare_image_for_ocr(image: np.ndarray) -> np.ndarray:
@@ -96,20 +117,10 @@ def _prepare_image_for_ocr(image: np.ndarray) -> np.ndarray:
 
 def run_ocr_worker(connection, requested_device: str) -> None:
     reader = None
-    active_device = requested_device
 
     try:
-        try:
-            reader = _build_reader(requested_device)
-        except Exception as gpu_exc:
-            if requested_device.startswith("gpu"):
-                print(f"[OCR worker] GPU init failed, falling back to CPU: {gpu_exc}")
-                active_device = "cpu"
-                reader = _build_reader(active_device)
-            else:
-                raise
-
-        connection.send({"status": "ready", "device": active_device})
+        reader = _build_reader(requested_device)
+        connection.send({"status": "ready", "device": requested_device})
 
         while True:
             message = connection.recv()

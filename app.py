@@ -7,6 +7,7 @@ from PySide6.QtCore import QThread, Qt, Signal
 from PySide6.QtGui import QImage, QMouseEvent, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
@@ -67,12 +68,14 @@ class VideoWorker(QThread):
         video_path: str,
         algorithm: str,
         parking_time_limit_s: float,
+        violation_debug: bool,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self.video_path = video_path
         self.algorithm = algorithm
         self.parking_time_limit_s = parking_time_limit_s
+        self.violation_debug = violation_debug
         self._running = True
         self._violation_keys: set[tuple[Any, ...]] = set()
 
@@ -93,6 +96,7 @@ class VideoWorker(QThread):
             sign_model_path=sign_model,
             plate_model_path="models/plates.pt",
             parking_time_limit_s=self.parking_time_limit_s,
+            draw_zone_debug=self.violation_debug,
         )
 
     @staticmethod
@@ -225,6 +229,9 @@ class MainWindow(QMainWindow):
         threshold_layout.setContentsMargins(0, 0, 0, 0)
         threshold_layout.addRow("Порог времени (3.28-3.30)", self.threshold_spin)
 
+        self.violation_debug_checkbox = QCheckBox("Debug: polygon and projection line")
+        self.violation_debug_checkbox.setChecked(False)
+
         self.start_button = QPushButton("Запустить")
         self.start_button.setMinimumHeight(52)
         self.start_button.clicked.connect(self.start_processing)
@@ -252,6 +259,7 @@ class MainWindow(QMainWindow):
         controls_layout.addWidget(QLabel("Алгоритм"))
         controls_layout.addWidget(self.algorithm_combo)
         controls_layout.addWidget(self.threshold_row)
+        controls_layout.addWidget(self.violation_debug_checkbox)
         controls_layout.addWidget(self.start_button)
         controls_layout.addWidget(self.stop_button)
         controls_layout.addStretch(1)
@@ -292,6 +300,7 @@ class MainWindow(QMainWindow):
     def _update_threshold_visibility(self) -> None:
         is_violation_mode = self.algorithm_combo.currentData() == "violations"
         self.threshold_row.setVisible(is_violation_mode)
+        self.violation_debug_checkbox.setVisible(is_violation_mode)
         self.violations_table.setVisible(is_violation_mode)
 
     def open_video(self) -> None:
@@ -345,6 +354,7 @@ class MainWindow(QMainWindow):
             video_path=self.video_path,
             algorithm=self.algorithm_combo.currentData(),
             parking_time_limit_s=self.threshold_spin.value(),
+            violation_debug=self.violation_debug_checkbox.isChecked(),
             parent=self,
         )
         self.worker.frame_ready.connect(self._set_video_frame)

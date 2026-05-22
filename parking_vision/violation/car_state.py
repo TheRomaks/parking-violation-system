@@ -4,7 +4,7 @@ from typing import Any
 from perception_types import Detection
 
 from .geometry import bbox_tuple_iou
-from .types import SignZone, ViolationRecord
+from .types import SignZone, ViolationRecord, ZoneAssignment
 
 
 class CarStateManager:
@@ -30,6 +30,7 @@ class CarStateManager:
                 "zone_entry_time": None,
                 "stop_start_time": None,
                 "active_zone": None,
+                "zone_assignment": None,
                 "last_bbox": None,
             }
         return self.track_states[track_id]
@@ -55,7 +56,7 @@ class CarStateManager:
         self,
         detection: Detection,
         timestamp_ms: float | None,
-        zone: SignZone | None,
+        assignment: ZoneAssignment | SignZone | None,
         plate_text: str,
     ) -> dict[str, Any]:
         if detection.track_id is None:
@@ -72,6 +73,16 @@ class CarStateManager:
 
         if plate_text:
             state["plate"] = plate_text
+
+        if isinstance(assignment, SignZone):
+            zone = assignment
+            state["zone_assignment"] = None
+        elif assignment is not None and assignment.applies:
+            zone = assignment.zone
+            state["zone_assignment"] = assignment
+        else:
+            zone = None
+            state["zone_assignment"] = assignment
 
         was_parked = state["is_parked"]
         state["is_parked"] = self._is_stopped(state["center_history"])
@@ -119,7 +130,11 @@ class CarStateManager:
         if state.get("stop_start_time") is not None:
             stop_duration = max(0.0, (timestamp_ms - state["stop_start_time"]) / 1000.0)
 
-        is_violation = stop_duration >= zone.time_limit_s if zone.time_limit_s > 0.0 else stop_duration >= 0.0
+        time_in_zone_s = (timestamp_ms - entry_time) / 1000.0
+        if zone.time_limit_s > 0.0:
+            is_violation = min(stop_duration, time_in_zone_s) >= zone.time_limit_s
+        else:
+            is_violation = stop_duration >= 0.0
         if not is_violation:
             return None
 
@@ -129,7 +144,7 @@ class CarStateManager:
             sign_id=zone.sign_id,
             sign_label=zone.sign_label,
             status="violation",
-            time_in_zone_s=(timestamp_ms - entry_time) / 1000.0,
+            time_in_zone_s=time_in_zone_s,
             stopped_duration_s=stop_duration,
             bbox=bbox,
         )
