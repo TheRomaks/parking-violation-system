@@ -1,4 +1,7 @@
+import csv
+import json
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +30,7 @@ from PySide6.QtWidgets import (
 
 from detect_and_read_plate import PlateReader
 from detect_and_track_cars import CarTracker
+from parking_vision.common.video import open_writer
 from sign_detect import SignDetector
 from violation_pipeline import ViolationPipeline
 
@@ -69,6 +73,7 @@ class VideoWorker(QThread):
         algorithm: str,
         parking_time_limit_s: float,
         violation_debug: bool,
+        save_results: bool,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -76,6 +81,7 @@ class VideoWorker(QThread):
         self.algorithm = algorithm
         self.parking_time_limit_s = parking_time_limit_s
         self.violation_debug = violation_debug
+        self.save_results = save_results
         self._running = True
         self._violation_keys: set[tuple[Any, ...]] = set()
 
@@ -119,6 +125,38 @@ class VideoWorker(QThread):
             )
         return annotated
 
+    def _build_output_dir(self) -> Path:
+        source_path = Path(self.video_path)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_dir = Path("outputs") / "gui" / f"{source_path.stem}_{self.algorithm}_{timestamp}"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        return output_dir
+
+    @staticmethod
+    def _write_violation_csv_row(
+        writer: csv.writer,
+        frame_index: int,
+        timestamp_ms: float | None,
+        violation: Any,
+    ) -> None:
+        writer.writerow(
+            [
+                frame_index,
+                "" if timestamp_ms is None else f"{timestamp_ms:.2f}",
+                violation.track_id,
+                violation.plate,
+                violation.sign_id,
+                violation.sign_label,
+                violation.status,
+                f"{violation.time_in_zone_s:.2f}",
+                f"{violation.stopped_duration_s:.2f}",
+                int(violation.bbox.x1),
+                int(violation.bbox.y1),
+                int(violation.bbox.x2),
+                int(violation.bbox.y2),
+            ]
+        )
+
     def _emit_unique_violations(self, violations: list[Any], timestamp_ms: float | None) -> None:
         for violation in violations:
             plate_value = violation.plate or f"track:{violation.track_id}"
@@ -152,6 +190,36 @@ class VideoWorker(QThread):
             return
 
         frame_index = 0
+        output_dir: Path | None = None
+        writer = None
+        jsonl_file = None
+        violation_csv_file = None
+        violation_csv_writer = None
+
+        if self.save_results:
+            output_dir = self._build_output_dir()
+            jsonl_file = (output_dir / "results.jsonl").open("w", encoding="utf-8")
+            if self.algorithm == "violations":
+                violation_csv_file = (output_dir / "violations.csv").open("w", newline="", encoding="utf-8")
+                violation_csv_writer = csv.writer(violation_csv_file)
+                violation_csv_writer.writerow(
+                    [
+                        "frame_index",
+                        "timestamp_ms",
+                        "track_id",
+                        "plate",
+                        "sign_id",
+                        "sign_label",
+                        "status",
+                        "time_in_zone_s",
+                        "stopped_duration_s",
+                        "x1",
+                        "y1",
+                        "x2",
+                        "y2",
+                    ]
+                )
+
         self.status_changed.emit("Обработка запущена")
         try:
             while self._running:
@@ -165,23 +233,58 @@ class VideoWorker(QThread):
                 if self.algorithm == "cars":
                     frame_result = algorithm.process_frame(frame, frame_index, timestamp_value)
                     annotated = algorithm.annotate_frame(frame, frame_result)
+                    result_payload = frame_result.to_dict()
+                    violations = []
                 elif self.algorithm == "signs":
                     frame_result = algorithm.process_frame(frame, frame_index, timestamp_value)
                     annotated = algorithm.annotate_frame(frame, frame_result)
+                    result_payload = frame_result.to_dict()
+                    violations = []
                 elif self.algorithm == "plates":
                     plate_result = algorithm.process_frame(frame)
                     annotated = self._annotate_plates(frame, plate_result)
+                    result_payload = {
+                        "frame_index": frame_index,
+                        "timestamp_ms": timestamp_value,
+                        "plates": plate_result,
+                    }
+                    violations = []
                 else:
-                    annotated, violations, _ = algorithm.process_frame(frame, frame_index, timestamp_value)
+                    annotated, violations, frame_result = algorithm.process_frame(frame, frame_index, timestamp_value)
+                    result_payload = frame_result.to_dict()
                     self._emit_unique_violations(violations, timestamp_value)
+
+                if self.save_results and output_dir is not None and jsonl_file is not None:
+                    if writer is None:
+                        writer = open_writer(output_dir / "annotated.mp4", capture, annotated)
+                    writer.write(annotated)
+                    jsonl_file.write(json.dumps(result_payload, ensure_ascii=False) + "\n")
+
+                    if violation_csv_writer is not None:
+                        for violation in violations:
+                            self._write_violation_csv_row(
+                                violation_csv_writer,
+                                frame_index,
+                                timestamp_value,
+                                violation,
+                            )
 
                 self.frame_ready.emit(frame_to_qimage(annotated))
                 frame_index += 1
         except Exception as exc:
             self.error.emit(str(exc))
         finally:
+            if writer is not None:
+                writer.release()
+            if jsonl_file is not None:
+                jsonl_file.close()
+            if violation_csv_file is not None:
+                violation_csv_file.close()
             capture.release()
-            self.status_changed.emit("Обработка завершена")
+            if self.save_results and output_dir is not None:
+                self.status_changed.emit(f"Обработка завершена. Сохранено: {output_dir}")
+            else:
+                self.status_changed.emit("Обработка завершена")
             self.finished_processing.emit()
 
 
@@ -232,6 +335,9 @@ class MainWindow(QMainWindow):
         self.violation_debug_checkbox = QCheckBox("Debug: polygon and projection line")
         self.violation_debug_checkbox.setChecked(False)
 
+        self.save_results_checkbox = QCheckBox("Сохранять результаты")
+        self.save_results_checkbox.setChecked(False)
+
         self.start_button = QPushButton("Запустить")
         self.start_button.setMinimumHeight(52)
         self.start_button.clicked.connect(self.start_processing)
@@ -260,13 +366,14 @@ class MainWindow(QMainWindow):
         controls_layout.addWidget(self.algorithm_combo)
         controls_layout.addWidget(self.threshold_row)
         controls_layout.addWidget(self.violation_debug_checkbox)
+        controls_layout.addWidget(self.save_results_checkbox)
         controls_layout.addWidget(self.start_button)
         controls_layout.addWidget(self.stop_button)
         controls_layout.addStretch(1)
         controls_layout.addWidget(self.status_label)
 
-        violations_group = QGroupBox("Нарушения")
-        violations_layout = QVBoxLayout(violations_group)
+        self.violations_group = QGroupBox("Нарушения")
+        violations_layout = QVBoxLayout(self.violations_group)
         violations_layout.addWidget(self.violations_table)
 
         video_title = QLabel("Видеопоток")
@@ -285,7 +392,7 @@ class MainWindow(QMainWindow):
 
         right_layout = QVBoxLayout()
         right_layout.addWidget(controls_group)
-        right_layout.addWidget(violations_group, 1)
+        right_layout.addWidget(self.violations_group, 1)
 
         main_layout = QHBoxLayout()
         main_layout.addLayout(left_layout, 3)
@@ -301,7 +408,7 @@ class MainWindow(QMainWindow):
         is_violation_mode = self.algorithm_combo.currentData() == "violations"
         self.threshold_row.setVisible(is_violation_mode)
         self.violation_debug_checkbox.setVisible(is_violation_mode)
-        self.violations_table.setVisible(is_violation_mode)
+        self.violations_group.setVisible(is_violation_mode)
 
     def open_video(self) -> None:
         file_path, _ = QFileDialog.getOpenFileName(
@@ -355,6 +462,7 @@ class MainWindow(QMainWindow):
             algorithm=self.algorithm_combo.currentData(),
             parking_time_limit_s=self.threshold_spin.value(),
             violation_debug=self.violation_debug_checkbox.isChecked(),
+            save_results=self.save_results_checkbox.isChecked(),
             parent=self,
         )
         self.worker.frame_ready.connect(self._set_video_frame)

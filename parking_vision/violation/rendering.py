@@ -100,7 +100,7 @@ def annotate_pipeline_frame(
         x1, y1, x2, y2 = car_detection.bbox.to_int_tuple()
         state = car_state_manager.get_track_status(car_detection.track_id)
         plate = state.get("plate") or result.plate_matches.get(car_detection.track_id, "unknown")
-        status = "Стоит" if state.get("is_parked") else "Движется"
+        status = "Stopped" if state.get("is_parked") else "Moving"
         zone = state.get("active_zone")
         assignment = state.get("zone_assignment")
         zone_timer = 0.0
@@ -113,7 +113,7 @@ def annotate_pipeline_frame(
         violation = violations_by_track.get(car_detection.track_id)
         if violation is not None:
             color = (0, 0, 255)
-            extra_label = f"НАРУШЕНИЕ {violation.sign_label}"
+            extra_label = f"Violation {violation.sign_label}"
         elif zone is not None and state.get("is_parked"):
             color = (0, 165, 255)
 
