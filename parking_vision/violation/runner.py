@@ -31,6 +31,7 @@ def run_pipeline(
 
     writer = open_writer(out.annotated_video_path, capture, first_frame)
     results: list[PipelineFrameResult] = []
+    emitted_violation_keys: set[tuple[int, int]] = set()
 
     try:
         with out.violations_csv_path.open("w", newline="", encoding="utf-8") as csv_file:
@@ -73,6 +74,10 @@ def run_pipeline(
                 writer.write(annotated_frame)
 
                 for violation in violations:
+                    violation_key = (violation.track_id, violation.sign_id)
+                    if violation_key in emitted_violation_keys:
+                        continue
+                    emitted_violation_keys.add(violation_key)
                     writer_csv.writerow(
                         [
                             frame_index,

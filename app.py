@@ -92,14 +92,13 @@ class VideoWorker(QThread):
         if self.algorithm == "cars":
             return CarTracker(model_path="models/cars.pt")
         if self.algorithm == "signs":
-            sign_model = "models/best.pt" if Path("models/best.pt").exists() else "models/signs.pt"
+            sign_model = "models/signs.pt"
             return SignDetector(model_path=sign_model)
         if self.algorithm == "plates":
             return PlateReader(model_path="models/plates.pt")
-        sign_model = "models/best.pt" if Path("models/best.pt").exists() else "models/signs.pt"
         return ViolationPipeline(
             car_model_path="models/cars.pt",
-            sign_model_path=sign_model,
+            sign_model_path="models/signs.pt",
             plate_model_path="models/plates.pt",
             parking_time_limit_s=self.parking_time_limit_s,
             draw_zone_debug=self.violation_debug,
@@ -112,7 +111,8 @@ class VideoWorker(QThread):
             x1, y1, x2, y2 = map(int, plate["bbox"])
             color = (0, 255, 0) if plate.get("valid") else (0, 0, 255)
             cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
-            label = f"{plate.get('text', '')} ({plate.get('ocr_conf', 0.0):.2f})"
+            label_text = plate.get("text") or "plate"
+            label = f"{label_text} ({plate.get('ocr_conf', 0.0):.2f})"
             cv2.putText(
                 annotated,
                 label,
@@ -157,13 +157,14 @@ class VideoWorker(QThread):
             ]
         )
 
-    def _emit_unique_violations(self, violations: list[Any], timestamp_ms: float | None) -> None:
+    def _emit_unique_violations(self, violations: list[Any], timestamp_ms: float | None) -> list[Any]:
+        emitted: list[Any] = []
         for violation in violations:
-            plate_value = violation.plate or f"track:{violation.track_id}"
-            key = (violation.track_id, violation.sign_id, plate_value)
+            key = (violation.track_id, violation.sign_id)
             if key in self._violation_keys:
                 continue
             self._violation_keys.add(key)
+            emitted.append(violation)
             self.violation_ready.emit(
                 {
                     "timestamp": format_timestamp(timestamp_ms),
@@ -173,6 +174,7 @@ class VideoWorker(QThread):
                     "plate": violation.plate or "unknown",
                 }
             )
+        return emitted
 
     def run(self) -> None:
         capture = cv2.VideoCapture(self.video_path)
@@ -235,11 +237,13 @@ class VideoWorker(QThread):
                     annotated = algorithm.annotate_frame(frame, frame_result)
                     result_payload = frame_result.to_dict()
                     violations = []
+                    violations_for_csv = []
                 elif self.algorithm == "signs":
                     frame_result = algorithm.process_frame(frame, frame_index, timestamp_value)
                     annotated = algorithm.annotate_frame(frame, frame_result)
                     result_payload = frame_result.to_dict()
                     violations = []
+                    violations_for_csv = []
                 elif self.algorithm == "plates":
                     plate_result = algorithm.process_frame(frame)
                     annotated = self._annotate_plates(frame, plate_result)
@@ -249,10 +253,11 @@ class VideoWorker(QThread):
                         "plates": plate_result,
                     }
                     violations = []
+                    violations_for_csv = []
                 else:
                     annotated, violations, frame_result = algorithm.process_frame(frame, frame_index, timestamp_value)
                     result_payload = frame_result.to_dict()
-                    self._emit_unique_violations(violations, timestamp_value)
+                    violations_for_csv = self._emit_unique_violations(violations, timestamp_value)
 
                 if self.save_results and output_dir is not None and jsonl_file is not None:
                     if writer is None:
@@ -261,7 +266,7 @@ class VideoWorker(QThread):
                     jsonl_file.write(json.dumps(result_payload, ensure_ascii=False) + "\n")
 
                     if violation_csv_writer is not None:
-                        for violation in violations:
+                        for violation in violations_for_csv:
                             self._write_violation_csv_row(
                                 violation_csv_writer,
                                 frame_index,

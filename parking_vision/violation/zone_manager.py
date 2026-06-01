@@ -6,7 +6,7 @@ import cv2
 import numpy as np
 
 from perception_types import Detection
-from road import RoadSegmenter
+from road_seg_yolo import RoadSegmenter
 
 from .constants import SIGN_TIME_LIMITS_S
 from .geometry import polygon_bbox
@@ -55,6 +55,8 @@ class SignZoneManager:
         max_missing_frames: int = 20,
         warmup_frames: int = 3,
         use_road_mask_geometry: bool = True,
+        sign_lock_confidence: float = 0.50,
+        sign_presence_confidence: float = 0.2,
         now_provider: Callable[[], datetime] | None = None,
     ) -> None:
         self.segmenter = RoadSegmenter(update_every_n_frames=1)
@@ -62,7 +64,10 @@ class SignZoneManager:
         self._next_id = 1
         self._max_missing_frames = max(1, int(max_missing_frames))
         self._use_road_mask_geometry = bool(use_road_mask_geometry)
+        self._sign_lock_confidence = float(sign_lock_confidence)
+        self._sign_presence_confidence = float(sign_presence_confidence)
         self._now_provider = now_provider or datetime.now
+        self.last_road_mask: np.ndarray | None = None
 
         self.time_limits_s = dict(SIGN_TIME_LIMITS_S)
         self.time_limits_s[1] = float(parking_time_limit_s)
@@ -90,6 +95,7 @@ class SignZoneManager:
         height, width = frame.shape[:2]
         road_masks = self.segmenter.get_masks(frame)
         road_mask = self._prepare_road_geometry_mask(road_masks["road"])
+        self.last_road_mask = road_mask
 
         if getattr(self.segmenter, "last_scene_cut", False):
             self._reset_scene()
@@ -97,7 +103,7 @@ class SignZoneManager:
         stacks = group_sign_stacks(sign_detections)
         terminators = [item for item in sign_detections if is_zone_terminator(item)]
         now = self._now_provider()
-        active_ids: set[int] = set()
+        observed_ids: set[int] = set()
 
         for stack in stacks:
             detection = stack.main
@@ -106,18 +112,22 @@ class SignZoneManager:
                 continue
 
             sign_id = self._find_sign_id(detection)
-            active_ids.add(sign_id)
+            observed_ids.add(sign_id)
             state = self._states.setdefault(
                 sign_id,
                 {
                     "source_bbox": detection.bbox,
                     "class_id": detection.class_id,
                     "sign_label": normalize_sign_label(detection),
+                    "last_confidence": 0.0,
+                    "current_confidence": 0.0,
+                    "locked": False,
                     "missed_frames": 0,
                     "side": "unknown",
                     "direction_vec": None,
                     "anchor": None,
                     "zone_mask": None,
+                    "side_mask": None,
                     "polygon": None,
                     "zone_metadata": {},
                     "rule": rule,
@@ -125,6 +135,11 @@ class SignZoneManager:
             )
             state["source_bbox"] = detection.bbox
             state["class_id"] = detection.class_id
+            state["current_confidence"] = float(detection.confidence)
+            state["last_confidence"] = max(float(state.get("last_confidence", 0.0)), float(detection.confidence))
+            if detection.confidence >= self._sign_lock_confidence:
+                state["locked"] = True
+            rule = self._select_effective_rule(state, rule)
             state["sign_label"] = rule.sign_label
             state["rule"] = rule
             state["missed_frames"] = 0
@@ -151,9 +166,42 @@ class SignZoneManager:
 
             self._update_state_from_result(state, result, width, height)
 
-        zones = self._build_active_zones(active_ids)
-        self._cleanup_missing(active_ids)
+        active_zone_ids = self._active_zone_ids(observed_ids)
+        zones = self._build_active_zones(active_zone_ids)
+        self._cleanup_missing(observed_ids)
         return zones
+
+    def _active_zone_ids(self, observed_ids: set[int]) -> set[int]:
+        active_ids: set[int] = set()
+        for sign_id in observed_ids:
+            state = self._states.get(sign_id)
+            if state is None:
+                continue
+            if float(state.get("current_confidence", 0.0)) < self._sign_presence_confidence:
+                continue
+            if state.get("polygon") is None or state.get("rule") is None:
+                continue
+            active_ids.add(sign_id)
+        return active_ids
+
+    @staticmethod
+    def _rule_has_plate_constraints(rule: SignRule) -> bool:
+        return bool(
+            rule.plate_labels
+            or rule.distance_m is not None
+            or rule.direction != "forward"
+            or rule.start_mode != "from_sign"
+        )
+
+    def _select_effective_rule(self, state: dict[str, Any], current_rule: SignRule) -> SignRule:
+        previous_rule = state.get("rule")
+        if not state.get("locked") or previous_rule is None:
+            return current_rule
+        if not isinstance(previous_rule, SignRule):
+            return current_rule
+        if self._rule_has_plate_constraints(previous_rule) and not self._rule_has_plate_constraints(current_rule):
+            return previous_rule
+        return current_rule
 
     def _update_state_from_result(
         self,
@@ -186,6 +234,7 @@ class SignZoneManager:
             state["direction_vec"] = normalize_vec(0.86 * previous + 0.14 * current)
 
         state["zone_mask"] = result.zone_mask
+        state["side_mask"] = result.side_mask
         state["polygon"] = result.polygon
         state["zone_metadata"] = dict(result.metadata)
 
@@ -211,6 +260,10 @@ class SignZoneManager:
             metadata = {
                 **dict(rule.metadata),
                 **dict(state.get("zone_metadata", {})),
+                "sign_locked": bool(state.get("locked", False)),
+                "sign_missed_frames": int(state.get("missed_frames", 0)),
+                "last_sign_confidence": round(float(state.get("last_confidence", 0.0)), 3),
+                "current_sign_confidence": round(float(state.get("current_confidence", 0.0)), 3),
                 "zone_start_point": dict(state.get("zone_metadata", {})).get(
                     "projected_sign_ground_point",
                     [float(polygon[0][0]), float(polygon[0][1])],
@@ -234,6 +287,8 @@ class SignZoneManager:
                     plate_labels=list(rule.plate_labels),
                     metadata=metadata,
                     zone_mask=zone_mask,
+                    side_mask=state.get("side_mask"),
+                    hard_road_mask=self.last_road_mask,
                     _bbox_x1=x1,
                     _bbox_y1=y1,
                     _bbox_x2=x2,
@@ -248,6 +303,7 @@ class SignZoneManager:
             if sign_id in active_ids:
                 continue
             state["missed_frames"] += 1
+            state["current_confidence"] = 0.0
             if state["missed_frames"] > self._max_missing_frames:
                 keys_to_delete.append(sign_id)
         for sign_id in keys_to_delete:

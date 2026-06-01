@@ -99,7 +99,7 @@ def annotate_pipeline_frame(
 
         x1, y1, x2, y2 = car_detection.bbox.to_int_tuple()
         state = car_state_manager.get_track_status(car_detection.track_id)
-        plate = state.get("plate") or result.plate_matches.get(car_detection.track_id, "unknown")
+        plate = state.get("plate") or result.plate_matches.get(car_detection.track_id) or "unknown"
         status = "Stopped" if state.get("is_parked") else "Moving"
         zone = state.get("active_zone")
         assignment = state.get("zone_assignment")

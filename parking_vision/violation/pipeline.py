@@ -12,6 +12,7 @@ from .car_state import CarStateManager
 from .geometry import bbox_intersection_area
 from .rendering import annotate_pipeline_frame
 from .types import PipelineFrameResult, ViolationRecord, ZoneAssignment
+from .vehicle_filter import VehicleCandidateFilter
 from .zone_manager import SignZoneManager
 from .zone_reasoner import ZoneReasoner
 
@@ -48,6 +49,7 @@ class ViolationPipeline:
             stop_distance_threshold_px=stop_distance_threshold_px,
             stop_frames_threshold=stop_frames_threshold,
         )
+        self.vehicle_filter = VehicleCandidateFilter()
 
     @staticmethod
     def _point_inside_bbox(x: float, y: float, bbox: BoundingBox, margin_px: float = 12.0) -> bool:
@@ -56,10 +58,26 @@ class ViolationPipeline:
             and (bbox.y1 - margin_px) <= y <= (bbox.y2 + margin_px)
         )
 
-    def _assign_plate_matches(self, plate_matches: dict[int, str]) -> None:
-        for track_id, text in plate_matches.items():
-            if track_id in self.car_state_manager.track_states and text:
-                self.car_state_manager.track_states[track_id]["plate"] = text
+    def _assign_plate_matches(
+        self,
+        plate_matches: dict[int, dict[str, Any]],
+        timestamp_ms: float | None,
+    ) -> dict[int, str]:
+        best_matches: dict[int, str] = {}
+        for track_id, plate in plate_matches.items():
+            if track_id not in self.car_state_manager.track_states:
+                continue
+            state = self.car_state_manager.update_plate_candidate(
+                track_id=track_id,
+                text=str(plate.get("text", "")),
+                ocr_conf=float(plate.get("ocr_conf", 0.0)),
+                detection_conf=float(plate.get("conf", 0.0)),
+                valid=bool(plate.get("valid", False)),
+                bbox=plate.get("bbox"),
+                timestamp_ms=timestamp_ms,
+            )
+            best_matches[track_id] = state.get("plate", "")
+        return best_matches
 
     @staticmethod
     def _normalize_plate_detections(plate_result: Any) -> list[dict[str, Any]]:
@@ -68,6 +86,9 @@ class ViolationPipeline:
                 {
                     "bbox": [det.bbox.x1, det.bbox.y1, det.bbox.x2, det.bbox.y2],
                     "text": det.metadata.get("plate_text", ""),
+                    "conf": det.confidence,
+                    "ocr_conf": det.metadata.get("ocr_conf", 0.0),
+                    "valid": det.metadata.get("valid", False),
                 }
                 for det in plate_result.detections
             ]
@@ -77,8 +98,8 @@ class ViolationPipeline:
         self,
         car_detections: list[Detection],
         plate_result: Any,
-    ) -> dict[int, str]:
-        matches: dict[int, str] = {}
+    ) -> dict[int, dict[str, Any]]:
+        matches: dict[int, dict[str, Any]] = {}
         for plate in self._normalize_plate_detections(plate_result):
             plate_box = BoundingBox(*plate["bbox"])
             plate_area = max(0.0, (plate_box.x2 - plate_box.x1) * (plate_box.y2 - plate_box.y1))
@@ -106,8 +127,19 @@ class ViolationPipeline:
                     best_score = score
                     best_id = car.track_id
 
-            if best_id is not None and best_score > 0.15 and plate.get("text"):
-                matches[best_id] = plate["text"]
+            if best_id is not None and best_score > 0.15:
+                previous = matches.get(best_id)
+                plate_quality = (
+                    best_score
+                    + float(plate.get("ocr_conf", 0.0))
+                    + float(plate.get("conf", 0.0)) * 0.25
+                    + (1.0 if plate.get("valid") else 0.0)
+                )
+                if previous is None or plate_quality > float(previous.get("match_quality", 0.0)):
+                    plate_match = dict(plate)
+                    plate_match["match_quality"] = plate_quality
+                    plate_match["match_score"] = best_score
+                    matches[best_id] = plate_match
 
         return matches
 
@@ -184,13 +216,19 @@ class ViolationPipeline:
         car_frame = self.car_tracker.process_frame(frame, frame_index, timestamp_ms)
         sign_detections = self._get_sign_detections(frame, frame_index, timestamp_ms)
         active_zones = self.sign_zone_manager.build_zones(sign_detections, frame, car_frame.detections)
+        car_detections = self.vehicle_filter.filter(
+            detections=car_frame.detections,
+            frame_shape=frame.shape,
+            road_mask=self.sign_zone_manager.last_road_mask,
+            zones=active_zones,
+        )
         if getattr(self.sign_zone_manager.segmenter, "last_scene_cut", False):
             self.zone_reasoner.reset()
 
         violations: list[ViolationRecord] = []
         zone_assignments: list[ZoneAssignment] = []
         active_ids: set[int] = set()
-        for car in car_frame.detections:
+        for car in car_detections:
             if car.track_id is None:
                 continue
             active_ids.add(car.track_id)
@@ -208,10 +246,10 @@ class ViolationPipeline:
         self.car_state_manager.cleanup(timestamp_ms, active_ids)
 
         plate_frame = self._get_plate_result(frame, frame_index)
-        plate_matches = self._match_plates_to_cars(car_frame.detections, plate_frame)
-        self._assign_plate_matches(plate_matches)
+        plate_observations = self._match_plates_to_cars(car_detections, plate_frame)
+        plate_matches = self._assign_plate_matches(plate_observations, timestamp_ms)
 
-        for car in car_frame.detections:
+        for car in car_detections:
             if car.track_id is None:
                 continue
             state = self.car_state_manager.get_track_status(car.track_id)
@@ -222,7 +260,7 @@ class ViolationPipeline:
         result = PipelineFrameResult(
             frame_index=frame_index,
             timestamp_ms=timestamp_ms,
-            car_detections=car_frame.detections,
+            car_detections=car_detections,
             sign_detections=sign_detections,
             plate_matches=plate_matches,
             active_zones=active_zones,

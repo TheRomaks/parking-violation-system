@@ -45,19 +45,21 @@ class PlateReader:
             if not is_valid_plate(bbox, detection_conf):
                 continue
 
+            text = ""
+            score = 0.0
             crop = crop_bbox(frame, bbox)
-            if crop is None:
-                continue
+            if crop is not None:
+                text, score = self.ocr.read(crop)
+                if score < 0.4:
+                    prepared_crop = preprocess(crop)
+                    if prepared_crop is not None:
+                        prepared_text, prepared_score = self.ocr.read(prepared_crop)
+                        if prepared_score > score:
+                            text, score = prepared_text, prepared_score
 
-            text, score = self.ocr.read(crop)
+            readable = score >= 0.4
             if score < 0.4:
-                prepared_crop = preprocess(crop)
-                if prepared_crop is None:
-                    continue
-                text, score = self.ocr.read(prepared_crop)
-
-            if score < 0.4:
-                continue
+                text = ""
 
             plates.append(
                 {
@@ -65,7 +67,8 @@ class PlateReader:
                     "conf": detection_conf,
                     "text": text,
                     "ocr_conf": score,
-                    "valid": bool(RUS_PLATE_PATTERN.match(text)),
+                    "valid": bool(readable and RUS_PLATE_PATTERN.match(text)),
+                    "readable": readable,
                 }
             )
 

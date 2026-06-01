@@ -19,12 +19,61 @@ class CarStateManager:
         self.stale_track_timeout_ms = stale_track_timeout_ms
         self.track_states: dict[int, dict[str, Any]] = {}
 
+    @staticmethod
+    def _clamp_confidence(value: float | None) -> float:
+        if value is None:
+            return 0.0
+        return max(0.0, min(1.0, float(value)))
+
+    @classmethod
+    def _plate_observation_score(
+        cls,
+        text: str,
+        ocr_conf: float | None,
+        detection_conf: float | None,
+        valid: bool,
+        bbox: list[float] | tuple[float, float, float, float] | None = None,
+    ) -> float:
+        if not text:
+            return 0.0
+        length_bonus = min(len(text), 9) / 9.0 * 0.15
+        validity_bonus = 1.0 if valid else 0.0
+        area_bonus = 0.0
+        if bbox is not None and len(bbox) == 4:
+            width = max(0.0, float(bbox[2]) - float(bbox[0]))
+            height = max(0.0, float(bbox[3]) - float(bbox[1]))
+            area_bonus = min(width * height / 4000.0, 1.0) * 0.35
+        return (
+            cls._clamp_confidence(ocr_conf) * 1.35
+            + cls._clamp_confidence(detection_conf) * 0.25
+            + validity_bonus
+            + length_bonus
+            + area_bonus
+        )
+
+    @staticmethod
+    def _plate_candidate_score(candidate: dict[str, Any], timestamp_ms: float | None) -> float:
+        count = int(candidate.get("count", 0))
+        stability_bonus = min(max(count - 1, 0), 4) * 0.08
+        score_sum = float(candidate.get("score_sum", 0.0))
+        recent_bonus = 0.0
+        last_seen = candidate.get("last_seen_time")
+        if timestamp_ms is not None and last_seen is not None:
+            age_ms = max(0.0, float(timestamp_ms) - float(last_seen))
+            recent_bonus = max(0.0, 1.0 - age_ms / 2500.0) * 0.55
+        return float(candidate.get("best_score", 0.0)) + stability_bonus + min(score_sum, 6.0) * 0.02 + recent_bonus
+
     def _ensure_state(self, track_id: int, timestamp_ms: float | None) -> dict[str, Any]:
         if track_id not in self.track_states:
             self.track_states[track_id] = {
                 "first_seen_time": timestamp_ms,
                 "last_seen_time": timestamp_ms,
                 "plate": "",
+                "plate_best_score": 0.0,
+                "plate_candidates": {},
+                "plate_bbox": None,
+                "plate_detection_conf": 0.0,
+                "plate_ocr_conf": 0.0,
                 "center_history": deque(maxlen=max(self.stop_frames_threshold, 2)),
                 "is_parked": False,
                 "zone_entry_time": None,
@@ -106,6 +155,77 @@ class CarStateManager:
             state["active_zone"] = zone
             if zone_changed or state["zone_entry_time"] is None:
                 state["zone_entry_time"] = timestamp_ms
+
+        return state
+
+    def update_plate_candidate(
+        self,
+        track_id: int,
+        text: str,
+        ocr_conf: float | None = None,
+        detection_conf: float | None = None,
+        valid: bool = False,
+        bbox: list[float] | tuple[float, float, float, float] | None = None,
+        timestamp_ms: float | None = None,
+    ) -> dict[str, Any]:
+        state = self._ensure_state(track_id, timestamp_ms)
+
+        if bbox is not None:
+            state["plate_bbox"] = [float(value) for value in bbox]
+        state["plate_detection_conf"] = max(
+            float(state.get("plate_detection_conf", 0.0)),
+            self._clamp_confidence(detection_conf),
+        )
+
+        text = str(text or "").strip()
+        if not text:
+            return state
+
+        observation_score = self._plate_observation_score(text, ocr_conf, detection_conf, valid, bbox)
+        candidates = state.setdefault("plate_candidates", {})
+        candidate = candidates.setdefault(
+            text,
+            {
+                "text": text,
+                "count": 0,
+                "score_sum": 0.0,
+                "best_score": 0.0,
+                "best_ocr_conf": 0.0,
+                "best_detection_conf": 0.0,
+                "valid": False,
+                "bbox": None,
+                "last_seen_time": None,
+            },
+        )
+        candidate["count"] = int(candidate["count"]) + 1
+        candidate["score_sum"] = float(candidate["score_sum"]) * 0.88 + observation_score
+        candidate["valid"] = bool(candidate["valid"] or valid)
+        candidate["last_seen_time"] = timestamp_ms
+        if observation_score >= float(candidate["best_score"]):
+            candidate["best_score"] = observation_score
+            candidate["best_ocr_conf"] = self._clamp_confidence(ocr_conf)
+            candidate["best_detection_conf"] = self._clamp_confidence(detection_conf)
+            candidate["bbox"] = state.get("plate_bbox")
+
+        best_text = ""
+        best_score = -1.0
+        for candidate_text, candidate_data in candidates.items():
+            candidate_score = self._plate_candidate_score(candidate_data, timestamp_ms)
+            if candidate_score > best_score:
+                best_text = candidate_text
+                best_score = candidate_score
+
+        if best_text:
+            best_candidate = candidates[best_text]
+            state["plate"] = best_text
+            state["plate_best_score"] = best_score
+            state["plate_ocr_conf"] = float(best_candidate.get("best_ocr_conf", 0.0))
+            state["plate_detection_conf"] = max(
+                float(state.get("plate_detection_conf", 0.0)),
+                float(best_candidate.get("best_detection_conf", 0.0)),
+            )
+            if best_candidate.get("bbox") is not None:
+                state["plate_bbox"] = best_candidate["bbox"]
 
         return state
 

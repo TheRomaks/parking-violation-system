@@ -51,7 +51,8 @@ def run_plate_reading(
                 x1, y1, x2, y2 = map(int, plate["bbox"])
                 color = (0, 255, 0) if plate["valid"] else (0, 0, 255)
                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                label = f"{plate['text']} ({plate['ocr_conf']:.2f})"
+                label_text = plate["text"] or "plate"
+                label = f"{label_text} ({plate['ocr_conf']:.2f})"
                 cv2.putText(
                     frame,
                     label,
